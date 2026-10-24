@@ -1,0 +1,74 @@
+name: Weaknet test build
+
+# Test build of the weak-network fixes (upstream PRs #4–#7), for trying the
+# app on a poor connection before they are merged. Lives only on the
+# weaknet-test branch of the fork; publishes a prerelease, never "latest".
+
+on:
+  push:
+    branches: [weaknet-test]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      # Builds main + renderer and runs every scripts/verify-*.cjs on Windows.
+      - name: Build and verify
+        run: npm run verify
+
+      - name: Bundle Node.js runtime and CLI tools
+        run: node scripts/bundle-tools.mjs
+
+      - name: Cache electron-builder binaries
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\electron-builder\Cache
+          key: electron-builder-cache-${{ runner.os }}-nsis
+
+      - name: Package Windows installer
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: npx electron-builder --win nsis --config.win.requestedExecutionLevel=asInvoker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: 弱网测试版 v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          files: release/*.exe
+          body: |
+            **测试版，非官方发布。** 包含上游 PR #4–#7 的修复，用于在弱网环境下实测。
+
+            为了能测到两条更新路径，这个版本刻意做了两处设置：
+            - 版本号 `1.2.4-weaknet.1` 低于官方 1.2.4，启动后会提示更新，可以实测安装包经镜像下载、断点续传和 SHA-256 校验。下载并校验通过后会自动打开官方 1.2.4 的安装程序；只想测下载的话，在安装程序里点取消即可。
+            - 内置的 Claude Code 2.1.309、Codex 0.163.0 各比最新版落后一个版本，可以实测工具在慢网下的更新。

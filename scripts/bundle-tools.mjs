@@ -20,12 +20,15 @@ const TOOLS = [
     {
         name: 'claude-code',
         package: '@anthropic-ai/claude-code',
+        // weaknet test build: one release behind so the in-app update path is exercised
+        version: '2.1.309',
         dir: join(TOOLS_DIR, 'claude-code'),
     },
     {
         name: 'codex',
         package: '@openai/codex',
-        // version: '0.100.0', // pinned for debug — remove to use latest
+        // weaknet test build: one release behind so the in-app update path is exercised
+        version: '0.163.0',
         dir: join(TOOLS_DIR, 'codex'),
     },
 ];
