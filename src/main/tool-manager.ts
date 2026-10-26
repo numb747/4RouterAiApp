@@ -9,9 +9,11 @@ import {
     CHINA_MIRROR_REGISTRY,
     NPM_INSTALL_TIMEOUT_MS,
     NPM_VIEW_TIMEOUT_MS,
+    FsFailure,
     RegistryProbe,
     buildNpmInstallArgs,
     buildNpmNetworkArgs,
+    classifyFsFailure,
     describeInstallTimeout,
     isTimeoutKill,
     pickTargetVersion,
@@ -20,6 +22,7 @@ import {
     platformPackageName,
     platformVersionMatches,
     registryLabel,
+    retryAfterTimeout,
 } from './npm-install-plan';
 
 export interface ToolInfo {
@@ -627,12 +630,12 @@ export class ToolManager {
             return { hasUpdate: false, currentVersion: tool.version, latestVersion: 'unknown' };
         }
 
-        // Same version choice as updateTool (pickTargetVersion): official
-        // registry's latest, npmmirror's only when the official one can't be
-        // reached. updateTool then pins that exact version, so the version
-        // seen here is the version that gets installed.
+        // Same version choice as updateTool (pickTargetVersion): the version
+        // of the registry it will be downloaded from — npmmirror unless a
+        // proxy is set. updateTool then pins that exact version, so the
+        // version seen here is the version that gets installed.
         const [official, mirror] = await this.probeLatestVersions(packageName);
-        const latest = pickTargetVersion(official, mirror);
+        const latest = pickTargetVersion(official, mirror, !!this.getProxy());
         if (!latest) {
             return { hasUpdate: false, currentVersion: tool.version, latestVersion: 'unknown' };
         }
@@ -721,6 +724,15 @@ export class ToolManager {
 
         const toolDir = path.join(this.bundledToolsPath,
             toolId === 'claude-code' ? 'claude-code' : 'codex');
+        const previousVersion = tool.broken ? undefined : tool.version;
+        const fail = (error?: string, failure?: FsFailure | null) =>
+            this.updateFailure(tool, previousVersion, toolDir, error, failure);
+
+        // Before any network round trip: npm would only hit EPERM after the
+        // version probes.
+        if (!this.canWrite(toolDir, packageName)) {
+            return fail(undefined, 'no-permission');
+        }
 
         if (!fs.existsSync(toolDir)) {
             fs.mkdirSync(toolDir, { recursive: true });
@@ -732,17 +744,17 @@ export class ToolManager {
             fs.writeFileSync(pkgJsonPath, '{"private":true}', 'utf-8');
         }
 
-        // Pin the version first, then install it from whichever registry
-        // answered faster — see planInstall for the full reasoning. The
-        // other registry is the fallback (a lagging mirror fails fast with
+        // Pin the version first, then install it from the registry
+        // planInstall puts first (npmmirror unless a proxy is set). The other
+        // registry is the fallback (a lagging mirror fails fast with
         // ETARGET), unless the failure is one a different registry can't
-        // fix: a permission error, or a timeout (the link itself is too slow
-        // — another 30-minute attempt would only double the wait).
+        // fix: a permission error or a locked file, or a timeout the official
+        // registry would only repeat (retryAfterTimeout).
+        const viaProxy = !!this.getProxy();
         const [official, mirror] = await this.probeLatestVersions(packageName);
-        const plan = planInstall(official, mirror);
+        const plan = planInstall(official, mirror, viaProxy);
         const spec = `${packageName}@${plan.spec}`;
         const [primary, secondary] = plan.registries;
-        const previousVersion = tool.broken ? undefined : tool.version;
 
         // Name the native-binary package explicitly so a dropped download
         // fails the install (and npm rolls back) instead of silently leaving
@@ -765,31 +777,32 @@ export class ToolManager {
             official: `${official.version ?? 'unreachable'} (${official.elapsedMs}ms)`,
             npmmirror: `${mirror.version ?? 'unreachable'} (${mirror.elapsedMs}ms)`,
             order: plan.registries.map(registryLabel),
+            viaProxy,
         });
 
-        const fail = (error?: string) => this.updateFailure(tool, previousVersion, error);
-
+        let used = primary;
         const result = await this.npmInstall(specs, toolDir, primary);
         if (!result.success) {
-            if (result.timedOut || this.isPermissionError(result.error)) {
+            if (classifyFsFailure(result.error || '') || (result.timedOut && !retryAfterTimeout(secondary))) {
                 return fail(result.error);
             }
 
             console.log(`[ToolManager] Install from ${registryLabel(primary)} failed, retrying with ${registryLabel(secondary)}...`);
             const retry = await this.npmInstall(specs, toolDir, secondary);
             if (!retry.success) {
-                if (retry.timedOut) return fail(retry.error);
                 return fail(`Install failed from both the ${registryLabel(primary)} and ${registryLabel(secondary)}.\n--- ${registryLabel(primary)} ---\n${result.error}\n--- ${registryLabel(secondary)} ---\n${retry.error}`);
             }
+            used = secondary;
         }
 
         // The launcher needs the platform package's package.json, at the
         // main package's version. If it's not there (an unpinned install, or
-        // a mirror that lags on the platform packages), retry once with the
-        // official registry.
+        // a registry that lags on the platform packages), retry once with
+        // the other registry.
         if (!this.platformPackageOk(toolId)) {
-            console.log(`[ToolManager] ${toolId} platform package missing after install, retrying with official registry...`);
-            const fallback = await this.npmInstall(specs, toolDir, OFFICIAL_REGISTRY);
+            const other = used === OFFICIAL_REGISTRY ? CHINA_MIRROR_REGISTRY : OFFICIAL_REGISTRY;
+            console.log(`[ToolManager] ${toolId} platform package missing after install, retrying with ${registryLabel(other)}...`);
+            const fallback = await this.npmInstall(specs, toolDir, other);
             if (!fallback.success) return fail(fallback.error);
             if (!this.platformPackageOk(toolId)) {
                 return fail('Platform-specific binary still missing after fallback install');
@@ -802,11 +815,37 @@ export class ToolManager {
     }
 
     /**
-     * A failed update, worded for the user: whether the tool still works (npm
-     * rolled back to the previous version) or needs another try, plus a hint
-     * when the files were locked by a running session. Raw npm output follows.
+     * Whether npm can write where it will start writing: a temp directory
+     * next to the installed package. Under Program Files (a machine-wide
+     * install) the app, which never runs elevated, can't.
      */
-    private updateFailure(tool: ToolInfo, previousVersion: string | undefined, error?: string) {
+    private canWrite(toolDir: string, packageName: string): boolean {
+        const scopeDir = path.join(toolDir, 'node_modules', packageName.split('/')[0]);
+        const dir = [scopeDir, path.dirname(scopeDir), toolDir, this.bundledToolsPath].find(d => fs.existsSync(d));
+        if (!dir) return true;
+        const probe = path.join(dir, `.4router-write-test-${process.pid}-${Date.now()}`);
+        try {
+            fs.mkdirSync(probe);
+            fs.rmdirSync(probe);
+            return true;
+        } catch (err: any) {
+            console.warn(`[ToolManager] ${dir} is not writable:`, err?.code || err);
+            return !(err?.code === 'EPERM' || err?.code === 'EACCES');
+        }
+    }
+
+    /**
+     * A failed update, worded for the user: whether the tool still works (npm
+     * rolled back to the previous version) or needs another try, plus what to
+     * do about a permission problem or locked files. Raw npm output follows.
+     */
+    private updateFailure(
+        tool: ToolInfo,
+        previousVersion: string | undefined,
+        toolDir: string,
+        error?: string,
+        failure: FsFailure | null = classifyFsFailure(error || ''),
+    ) {
         this.detectTools();
         const lines: string[] = [];
         if (!tool.broken && tool.version && tool.version === previousVersion) {
@@ -816,21 +855,15 @@ export class ToolManager {
         } else {
             lines.push(`${tool.name} 更新未完成。`);
         }
-        if (error && /\b(EBUSY|EPERM)\b/.test(error)) {
+        if (failure === 'no-permission') {
+            lines.push(`安装目录没有写入权限（${toolDir}）：4RouterAi 可能装在了「所有用户」目录（如 C:\\Program Files）。请卸载后重新安装，安装时保持默认目录。`);
+        } else if (failure === 'locked') {
             lines.push(`文件被占用：请关闭所有 ${tool.name} 标签页后重试。`);
+        } else if (failure === 'locked-or-no-permission') {
+            lines.push(`文件被占用或没有写入权限：请先关闭所有 ${tool.name} 标签页再试；仍然失败的话，卸载后重新安装到默认目录。`);
         }
         if (error) lines.push('', error);
         return { success: false, version: tool.version, error: lines.join('\n') };
-    }
-
-    /**
-     * Permission failures (e.g. the app is installed under Program Files
-     * and npm can't write to resources/bundled-tools) and locked files (a
-     * running session holding the binary, EBUSY) won't be fixed by
-     * switching registries — don't waste a retry on them.
-     */
-    private isPermissionError(message?: string): boolean {
-        return !!message && /\b(EPERM|EACCES|EBUSY)\b/.test(message);
     }
 
     private npmInstall(
