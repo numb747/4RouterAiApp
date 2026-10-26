@@ -5,7 +5,7 @@
  * codex-win32-x64 ~173 MB): a 2-minute exec timeout killed every install
  * below ~1.2 MB/s, the settings-page proxy never reached npm, and the
  * official registry — reachable but crawling from mainland China — was
- * always tried first.
+ * always tried first. Without a proxy, npmmirror now goes first.
  *
  * npm is never spawned: ToolManager.runFile is stubbed, so this checks the
  * exact argv / options handed to npm and the registry order it walks.
@@ -168,6 +168,8 @@ async function main() {
     check('--registry set', argAfter(bare, '--registry') === OFFICIAL);
     check('no proxy flags without a proxy', !bare.includes('--proxy') && !bare.includes('--https-proxy'));
     check('--fetch-retries raised above the default 2', Number(argAfter(bare, '--fetch-retries')) > 2);
+    check('stalled requests given up on well before npm\'s 5-minute default',
+        Number(argAfter(bare, '--fetch-timeout')) <= 2 * 60 * 1000, argAfter(bare, '--fetch-timeout'));
     check('audit/fund round-trips skipped', bare.includes('--no-audit') && bare.includes('--no-fund'));
     const proxied = plan.buildNpmInstallArgs([`${PKG}@2.1.200`], MIRROR, ` ${PROXY} `);
     check('--proxy passed (trimmed)', argAfter(proxied, '--proxy') === PROXY, proxied.join(' '));
@@ -175,22 +177,44 @@ async function main() {
     check('blank proxy ignored', !plan.buildNpmNetworkArgs(OFFICIAL, '  ').includes('--proxy'));
 
     console.log('\n[3] Registry order (planInstall)');
-    let p = plan.planInstall(probe(OFFICIAL, '2.1.200', 900), probe(MIRROR, '2.1.200', 120));
-    check('same version, mirror faster → mirror first, pinned',
-        p.registries[0] === MIRROR && p.registries[1] === OFFICIAL && p.spec === '2.1.200', JSON.stringify(p));
-    p = plan.planInstall(probe(OFFICIAL, '2.1.200', 100), probe(MIRROR, '2.1.200', 400));
-    check('same version, official faster → official first', p.registries[0] === OFFICIAL, JSON.stringify(p));
-    p = plan.planInstall(probe(OFFICIAL, '2.1.200', 900), probe(MIRROR, '2.1.199', 50));
-    check('mirror lagging → official first, official version',
-        p.registries[0] === OFFICIAL && p.spec === '2.1.200', JSON.stringify(p));
-    p = plan.planInstall(probe(OFFICIAL, null, 15000), probe(MIRROR, '2.1.199', 300));
-    check('official unreachable → mirror first, mirror version',
-        p.registries[0] === MIRROR && p.spec === '2.1.199', JSON.stringify(p));
-    p = plan.planInstall(probe(OFFICIAL, null, 15000), probe(MIRROR, null, 15000));
-    check('both unreachable → latest, mirror first, official as fallback',
-        p.spec === 'latest' && p.registries[0] === MIRROR && p.registries[1] === OFFICIAL, JSON.stringify(p));
-    check('target version prefers official',
-        plan.pickTargetVersion(probe(OFFICIAL, '2.1.200', 0), probe(MIRROR, '2.1.199', 0)) === '2.1.200');
+    const order = (official, mirror, viaProxy) => {
+        const p = plan.planInstall(official, mirror, viaProxy);
+        return `${p.spec} ${p.registries.map(plan.registryLabel).join(' > ')}`;
+    };
+    let o = order(probe(OFFICIAL, '2.1.200', 100), probe(MIRROR, '2.1.200', 400), false);
+    check('no proxy: mirror first even when official answered faster', o === '2.1.200 npmmirror > official registry', o);
+    o = order(probe(OFFICIAL, '2.1.200', 900), probe(MIRROR, '2.1.199', 50), false);
+    check('no proxy: lagging mirror → its version, from the mirror', o === '2.1.199 npmmirror > official registry', o);
+    o = order(probe(OFFICIAL, '2.1.200', 100), probe(MIRROR, null, 15000), false);
+    check('no proxy: mirror unreachable → official', o === '2.1.200 official registry > npmmirror', o);
+    o = order(probe(OFFICIAL, '2.1.200', 900), probe(MIRROR, '2.1.200', 120), true);
+    check('proxy: same version, mirror faster → mirror first', o === '2.1.200 npmmirror > official registry', o);
+    o = order(probe(OFFICIAL, '2.1.200', 100), probe(MIRROR, '2.1.200', 400), true);
+    check('proxy: same version, official faster → official first', o === '2.1.200 official registry > npmmirror', o);
+    o = order(probe(OFFICIAL, '2.1.200', 900), probe(MIRROR, '2.1.199', 50), true);
+    check('proxy: lagging mirror → official version, official first', o === '2.1.200 official registry > npmmirror', o);
+    o = order(probe(OFFICIAL, null, 15000), probe(MIRROR, '2.1.199', 300), true);
+    check('proxy: official unreachable → mirror', o === '2.1.199 npmmirror > official registry', o);
+    o = order(probe(OFFICIAL, null, 15000), probe(MIRROR, null, 15000), false);
+    check('both unreachable → latest, mirror first', o === 'latest npmmirror > official registry', o);
+    check('a timeout is retried on the mirror', plan.retryAfterTimeout(MIRROR));
+    check('…but not on the official registry', !plan.retryAfterTimeout(OFFICIAL));
+
+    console.log('\n[3b] What EPERM / EACCES / EBUSY mean (classifyFsFailure)');
+    // Verbatim from the field: a machine-wide install under Program Files.
+    const programFiles = [
+        'npm error code EPERM',
+        'npm error syscall mkdir',
+        "npm error path C:\\Program Files\\4RouterAi\\resources\\bundled-tools\\claude-code\\node_modules\\@anthropic-ai\\.claude-code-eMfe0VVG",
+        'npm error errno -4048',
+    ].join('\n');
+    check('mkdir EPERM → no permission', plan.classifyFsFailure(programFiles) === 'no-permission');
+    check('rename EPERM → locked', plan.classifyFsFailure('npm error code EPERM\nnpm error syscall rename') === 'locked');
+    check('unlink EPERM → locked', plan.classifyFsFailure('npm ERR! code EPERM\nnpm ERR! syscall unlink') === 'locked');
+    check('EBUSY → locked', plan.classifyFsFailure('npm error code EBUSY') === 'locked');
+    check('EACCES → no permission', plan.classifyFsFailure('npm error code EACCES') === 'no-permission');
+    check('EPERM without a syscall → either', plan.classifyFsFailure('EPERM: operation not permitted') === 'locked-or-no-permission');
+    check('network errors are none of these', plan.classifyFsFailure('npm error code ECONNRESET') === null);
 
     console.log('\n[4] updateTool: proxy, timeout and order reach npm');
     {
@@ -242,13 +266,25 @@ async function main() {
         check('fallback keeps the pinned version', installs[1]?.args[1] === `${PKG}@2.1.200`);
     }
     {
+        // Through a proxy the official registry answered first, then crawled.
         const { manager, installCalls } = makeManager({
             proxy: PROXY,
             views: { [OFFICIAL]: { version: '2.1.200', delayMs: 0 }, [MIRROR]: { version: '2.1.200', delayMs: 30 } },
             installs: [timeoutError],
         });
         const result = await manager.updateTool('claude-code');
-        check('timeout is not retried on the other registry', installCalls().length === 1,
+        const installs = installCalls();
+        check('official timeout is retried on the mirror', result.success && installs.length === 2
+            && installs[0].registry === OFFICIAL && installs[1].registry === MIRROR,
+            JSON.stringify(installs.map(i => i.registry)));
+    }
+    {
+        const { manager, installCalls } = makeManager({
+            views: { [OFFICIAL]: { version: '2.1.200', delayMs: 0 }, [MIRROR]: { version: '2.1.200', delayMs: 30 } },
+            installs: [timeoutError],
+        });
+        const result = await manager.updateTool('claude-code');
+        check('mirror timeout is not retried on the official registry', installCalls().length === 1,
             String(installCalls().length));
         check('timeout error is readable', !result.success && /下载超时/.test(result.error || ''), result.error);
         check('timeout error mentions the proxy setting', /代理/.test(result.error || ''));
@@ -262,6 +298,35 @@ async function main() {
         const result = await manager.updateTool('claude-code');
         check('permission error is not retried', !result.success && installCalls().length === 1,
             String(installCalls().length));
+        check('…and an unclear EPERM names both causes', /文件被占用或没有写入权限/.test(result.error || ''), result.error);
+    }
+    {
+        // The field report: npm's own mkdir under Program Files.
+        const { manager, installCalls } = makeManager({
+            installed: '2.1.100',
+            views: { [OFFICIAL]: { version: '2.1.200', delayMs: 0 }, [MIRROR]: { version: '2.1.200', delayMs: 30 } },
+            installs: [() => Object.assign(new Error('Command failed'), { code: 1,
+                message: 'npm error code EPERM\nnpm error syscall mkdir\nnpm error errno -4048' })],
+        });
+        const result = await manager.updateTool('claude-code');
+        check('mkdir EPERM is reported as a permission problem', /安装目录没有写入权限/.test(result.error || '')
+            && /重新安装/.test(result.error || ''), result.error);
+        check('…not as locked files', !/文件被占用/.test(result.error || ''), result.error);
+        check('…and the old version is still usable', /已保留原来的版本 2\.1\.100/.test(result.error || ''));
+        check('…without a second attempt', installCalls().length === 1);
+    }
+    if (os.platform() !== 'win32' && process.getuid?.() !== 0) {
+        // An unwritable install dir is caught before any network round trip.
+        const { manager, calls } = makeManager({
+            installed: '2.1.100',
+            views: { [OFFICIAL]: { version: '2.1.200', delayMs: 0 }, [MIRROR]: { version: '2.1.200', delayMs: 0 } },
+        });
+        const scope = path.join(manager.bundledToolsPath, 'claude-code', 'node_modules', '@anthropic-ai');
+        fs.chmodSync(scope, 0o555);
+        const result = await manager.updateTool('claude-code');
+        fs.chmodSync(scope, 0o755);
+        check('read-only tool dir: no npm call at all', calls.length === 0, String(calls.length));
+        check('read-only tool dir: told why', !result.success && /安装目录没有写入权限/.test(result.error || ''), result.error);
     }
     {
         // Like execFile's real error: the message echoes the full command line.
@@ -368,6 +433,15 @@ async function main() {
         check('official latest wins over a lagging mirror', info.latestVersion === '2.1.200', info.latestVersion);
         check('update offered', info.hasUpdate === true);
         check('check probes go through the proxy', calls.every(c => argAfter(c.args, '--proxy') === PROXY));
+    }
+    {
+        const { manager } = makeManager({
+            views: { [OFFICIAL]: { version: '2.1.200', delayMs: 50 }, [MIRROR]: { version: '2.1.199', delayMs: 0 } },
+        });
+        manager.getToolStatus('claude-code').version = '2.1.100';
+        const info = await manager.checkUpdate('claude-code');
+        check('no proxy: the mirror\'s version is offered (that is where it comes from)', info.latestVersion === '2.1.199',
+            info.latestVersion);
     }
 }
 

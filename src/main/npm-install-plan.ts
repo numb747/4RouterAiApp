@@ -29,6 +29,15 @@ export const NPM_VIEW_TIMEOUT_MS = 15000;
  */
 const NPM_FETCH_RETRIES = 4;
 
+/**
+ * How long a registry request may sit without receiving data before npm
+ * gives up on it and retries. npm's default is 5 minutes, so a stalled
+ * tarball burned 5 minutes per attempt and a few stalls used up the whole
+ * NPM_INSTALL_TIMEOUT_MS. It is an idle timeout, so a slow but moving
+ * download is not cut off.
+ */
+const NPM_FETCH_TIMEOUT_MS = 2 * 60 * 1000;
+
 export interface RegistryProbe {
     registry: string;
     /** `latest` version this registry reported, or null if the query failed. */
@@ -70,6 +79,7 @@ export function buildNpmInstallArgs(specs: string[], registry: string, proxy?: s
         'install', ...specs,
         ...buildNpmNetworkArgs(registry, proxy),
         '--fetch-retries', String(NPM_FETCH_RETRIES),
+        '--fetch-timeout', String(NPM_FETCH_TIMEOUT_MS),
         '--no-audit',
         '--no-fund',
     ];
@@ -77,38 +87,42 @@ export function buildNpmInstallArgs(specs: string[], registry: string, proxy?: s
 
 /**
  * The version the user is offered (checkUpdate) and the one updateTool
- * installs. The official registry is authoritative; npmmirror can lag, so
- * its answer is only used when the official registry couldn't be reached.
+ * installs — whatever the registry it will come from serves.
+ *
+ * Without a proxy that is npmmirror: from mainland China the official
+ * registry is often reachable but crawls, and the ~150 MB platform tarball
+ * is exactly where that hurts. A mirror that hasn't synced the newest
+ * release yet just means that release is offered a little later, rather
+ * than downloaded from the slow registry. Through a proxy the official
+ * registry is usable, so its version wins and the mirror only covers for it.
  */
-export function pickTargetVersion(official: RegistryProbe, mirror: RegistryProbe): string | null {
-    return official.version ?? mirror.version;
+export function pickTargetVersion(official: RegistryProbe, mirror: RegistryProbe, viaProxy: boolean): string | null {
+    return viaProxy ? official.version ?? mirror.version : mirror.version ?? official.version;
 }
 
 /**
- * Decide what to install and from where.
+ * Decide what to install and from where. The version is pinned first
+ * (pickTargetVersion); the other registry stays as the fallback.
  *
- * The version is pinned first (pickTargetVersion), so the source no longer
- * decides *what* gets installed — only how fast. From mainland China the
- * official registry is often reachable but crawls, and the ~150 MB platform
- * tarballs are exactly where that hurts, so the faster of the two probes
- * goes first. npmmirror only leads when it already serves the target as
- * `latest`; if it is lagging it would just fail with ETARGET. The other
- * registry stays as the fallback.
+ * Without a proxy the mirror goes first whenever it answered. A timing race
+ * isn't used here: the probe is one small metadata request, and the official
+ * registry winning it says nothing about how a 150 MB download will go.
+ * Through a proxy the faster probe goes first, but npmmirror only leads when
+ * it already has the target; a lagging mirror would just fail with ETARGET.
  *
  * When neither probe answered the network is in bad shape and nothing can be
- * pinned; install `latest` from the mirror first, since for this app's users
- * the official registry is the one that is usually unreachable.
+ * pinned; install `latest` from the mirror first.
  */
-export function planInstall(official: RegistryProbe, mirror: RegistryProbe): InstallPlan {
+export function planInstall(official: RegistryProbe, mirror: RegistryProbe, viaProxy: boolean): InstallPlan {
     const officialFirst: [string, string] = [OFFICIAL_REGISTRY, CHINA_MIRROR_REGISTRY];
     const mirrorFirst: [string, string] = [CHINA_MIRROR_REGISTRY, OFFICIAL_REGISTRY];
 
-    const target = pickTargetVersion(official, mirror);
+    const target = pickTargetVersion(official, mirror, viaProxy);
     if (!target) {
         return { spec: 'latest', registries: mirrorFirst };
     }
-    if (!official.version) {
-        return { spec: target, registries: mirrorFirst };
+    if (!official.version || !viaProxy) {
+        return { spec: target, registries: mirror.version === target ? mirrorFirst : officialFirst };
     }
     if (mirror.version !== target) {
         return { spec: target, registries: officialFirst };
@@ -117,6 +131,37 @@ export function planInstall(official: RegistryProbe, mirror: RegistryProbe): Ins
         spec: target,
         registries: mirror.elapsedMs < official.elapsedMs ? mirrorFirst : officialFirst,
     };
+}
+
+/**
+ * Whether to try the other registry after an install timed out. A timeout
+ * means the link was too slow for that registry, which npmmirror can still
+ * beat; the official registry won't beat a mirror that already timed out,
+ * and would only add another NPM_INSTALL_TIMEOUT_MS of waiting.
+ */
+export function retryAfterTimeout(next: string): boolean {
+    return next === CHINA_MIRROR_REGISTRY;
+}
+
+export type FsFailure = 'no-permission' | 'locked' | 'locked-or-no-permission';
+
+/**
+ * What a failed npm install's EPERM / EACCES / EBUSY means for the user,
+ * judged from npm's `code` and `syscall` lines. On Windows, creating a
+ * directory fails with EPERM only for lack of permission (npm's first step
+ * is mkdir of a fresh temp name next to the old package, which nothing can
+ * be holding), while renaming or deleting fails with EPERM when the file is
+ * in use — a running claude.exe. Null for every other failure.
+ */
+export function classifyFsFailure(output: string): FsFailure | null {
+    const code = /\b(EPERM|EACCES|EBUSY)\b/.exec(output)?.[1];
+    if (!code) return null;
+    if (code === 'EBUSY') return 'locked';
+    if (code === 'EACCES') return 'no-permission';
+    const syscall = /npm (?:error|ERR!) syscall (\w+)/.exec(output)?.[1];
+    if (syscall === 'mkdir' || syscall === 'open' || syscall === 'copyfile') return 'no-permission';
+    if (syscall === 'rename' || syscall === 'unlink' || syscall === 'rmdir') return 'locked';
+    return 'locked-or-no-permission';
 }
 
 /**
