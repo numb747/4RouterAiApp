@@ -1,6 +1,6 @@
 name: Weaknet test build
 
-# Test build of the weak-network fixes (upstream PRs #4–#7), for trying the
+# Test build of the weak-network fixes (upstream PRs #4–#9), for trying the
 # app on a poor connection before they are merged. Lives only on the
 # weaknet-test branch of the fork; publishes a prerelease, never "latest".
 
@@ -67,8 +67,13 @@ jobs:
           make_latest: false
           files: release/*.exe
           body: |
-            **测试版，非官方发布。** 包含上游 PR #4–#7 的修复，用于在弱网环境下实测。
+            **测试版，非官方发布。** 包含上游 PR #4–#9 的修复，用于在弱网环境下实测。
 
             为了能测到两条更新路径，这个版本刻意做了两处设置：
             - 版本号低于官方 1.2.4，启动后会提示更新，可以实测安装包经镜像下载、断点续传和 SHA-256 校验。下载并校验通过后会自动打开官方 1.2.4 的安装程序；只想测下载的话，在安装程序里点取消即可。
             - 内置的 Claude Code 2.1.309、Codex 0.163.0 各比最新版落后一个版本，可以实测工具在慢网下的更新。
+
+            weaknet.3 新增：
+            - 安装程序固定「仅为我安装」，装到 `%LOCALAPPDATA%\Programs\4RouterAi`。如果以前装过「所有用户」版本（`C:\Program Files\4RouterAi`），装完会询问是否卸载旧版：选「是」需要确认一次管理员权限，设置和登录信息会保留。
+            - 没配代理时，工具更新优先从 npmmirror 下载；错误提示能区分「没有写入权限」和「文件被占用」。
+            - 「发现新的模型配置」弹窗可以逐项勾选，没勾选的项不会每次启动都再问（比如 Claude Code effort 的 max）。
